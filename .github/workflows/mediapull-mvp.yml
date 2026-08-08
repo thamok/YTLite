@@ -1,0 +1,122 @@
+name: Build MediaPull MVP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'MediaPullMVP/bootstrap.sh'
+      - '.github/workflows/mediapull-mvp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source tree
+        run: |
+          chmod +x MediaPullMVP/bootstrap.sh
+          MediaPullMVP/bootstrap.sh
+
+      - name: Test MediaCore
+        working-directory: MediaPullMVP/Packages/MediaCore
+        run: swift test
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        working-directory: MediaPullMVP
+        run: xcodegen generate
+
+      - name: Build unsigned arm64 device app
+        working-directory: MediaPullMVP
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          rm -rf DerivedData
+          xcodebuild \
+            -project MediaPull.xcodeproj \
+            -scheme MediaPull \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            build | tee xcodebuild.log
+
+      - name: Package and verify unsigned IPA
+        working-directory: MediaPullMVP
+        run: |
+          set -euo pipefail
+          APP="$PWD/DerivedData/Build/Products/Release-iphoneos/MediaPull.app"
+          EXE="$APP/MediaPull"
+
+          test -x "$EXE"
+          test -f "$APP/Info.plist"
+          test ! -d "$APP/_CodeSignature"
+
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")
+          test "$BUNDLE_ID" = 'dev.mediapull.app'
+          test "$MIN_OS" = '16.0'
+          file "$EXE" | grep -q 'Mach-O 64-bit executable arm64'
+
+          INTENT_METADATA=$(find "$APP" -type f -path '*Metadata.appintents*' -print -quit)
+          test -n "$INTENT_METADATA"
+
+          rm -rf artifacts
+          mkdir -p artifacts/Payload
+          cp -R "$APP" artifacts/Payload/MediaPull.app
+          (cd artifacts && zip -qry MediaPull-unsigned.ipa Payload)
+          unzip -t artifacts/MediaPull-unsigned.ipa
+
+          {
+            echo '== bundle =='
+            echo "CFBundleIdentifier=$BUNDLE_ID"
+            echo "MinimumOSVersion=$MIN_OS"
+            echo 'CodeSignature=absent (expected unsigned build)'
+            echo
+            echo '== executable =='
+            file "$EXE"
+            otool -l "$EXE" | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' || true
+            echo
+            echo '== App Intents metadata =='
+            find "$APP" -path '*Metadata.appintents*' -print | sort
+            echo
+            echo '== linked frameworks =='
+            otool -L "$EXE"
+            echo
+            echo '== IPA =='
+            file artifacts/MediaPull-unsigned.ipa
+            shasum -a 256 artifacts/MediaPull-unsigned.ipa
+            echo
+            echo '== bundle contents =='
+            find "$APP" -maxdepth 4 -type f | sort
+          } | tee artifacts/build-report.txt
+
+      - name: Commit source, project, IPA, and verification report
+        run: |
+          git config user.name 'MediaPull Build Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -f \
+            MediaPullMVP/App \
+            MediaPullMVP/Packages \
+            MediaPullMVP/Scripts \
+            MediaPullMVP/project.yml \
+            MediaPullMVP/README.md \
+            MediaPullMVP/.gitignore \
+            MediaPullMVP/MediaPull.xcodeproj \
+            MediaPullMVP/artifacts/MediaPull-unsigned.ipa \
+            MediaPullMVP/artifacts/build-report.txt \
+            MediaPullMVP/xcodebuild.log
+          git commit -m 'build: MediaPull unsigned IPA [skip ci]' || exit 0
+          git push origin HEAD:main
